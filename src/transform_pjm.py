@@ -11,7 +11,10 @@ RAW_KEY = "raw/source=pjm/region=pjme/PJME_hourly.csv"
 CURATED_PREFIX = "curated/source=pjm/dataset=load_hourly"
 REPORT_KEY = "quality/source=pjm/dataset=load_hourly/report.json"
 LOCAL_TZ = "America/New_York"
+# heuristic threshold calibrated on this dataset: a flag is a deviation, not an error
 LOW_RATIO = 0.75
+# same weekday-hour: 4 weeks before + 4 weeks after + the row itself
+BASELINE_WINDOW = 9
 
 
 def read_raw(s3):
@@ -67,12 +70,15 @@ def find_gaps(out):
 
 def add_deviation(out):
     out = out.sort_values("ts_utc").reset_index(drop=True)
-    out["local_hour"] = out["ts_utc"].dt.tz_convert(LOCAL_TZ).dt.hour
-    out["baseline_mw"] = out.groupby("local_hour")["pjm_mw"].transform(
-        lambda s: s.rolling(31, center=True, min_periods=15).median()
+    local = out["ts_utc"].dt.tz_convert(LOCAL_TZ)
+    out["local_hour"] = local.dt.hour
+    out["local_weekday"] = local.dt.dayofweek
+    # baseline = median of the same weekday and hour in the neighbouring weeks
+    out["baseline_mw"] = out.groupby(["local_weekday", "local_hour"])["pjm_mw"].transform(
+        lambda s: s.rolling(BASELINE_WINDOW, center=True, min_periods=5).median()
     )
     out["ratio_to_baseline"] = out["pjm_mw"] / out["baseline_mw"]
-    out["dq_low_outlier"] = out["ratio_to_baseline"] < LOW_RATIO
+    out["dq_low_deviation"] = out["ratio_to_baseline"] < LOW_RATIO
     return out
 
 
@@ -90,8 +96,9 @@ def write_curated(s3, out):
 
 
 def build_report(rows_raw, out, full, missing):
-    low = out[out["dq_low_outlier"]]
-    low_days = sorted({ts.date().isoformat() for ts in low["ts_utc"].dt.tz_convert(LOCAL_TZ)})
+    low = out[out["dq_low_deviation"]]
+    local_dates = low["ts_utc"].dt.tz_convert(LOCAL_TZ).dt.date
+    top_days = local_dates.value_counts().head(10)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "rows_raw": int(rows_raw),
@@ -101,11 +108,17 @@ def build_report(rows_raw, out, full, missing):
         "missing_hourly_instants": int(len(missing)),
         "missing_utc": [ts.isoformat() for ts in missing],
         "dst_ambiguous_rows": int(out["dst_ambiguous"].sum()),
-        "low_outlier_rows": int(len(low)),
-        "low_outlier_days_local": low_days,
+        "low_deviation_rule": (
+            f"pjm_mw < {LOW_RATIO} x median of the same local weekday-hour "
+            "in the 4 weeks before and after"
+        ),
+        "low_deviation_rows": int(len(low)),
+        "low_deviation_days": int(local_dates.nunique()),
+        "top_days_by_flagged_hours": {d.isoformat(): int(n) for d, n in top_days.items()},
         "assumptions": [
             "label marks the end of the hour (confirmed by consistency test, not documented by source)",
             "first row of a repeated label is daylight time (assumption, affects 4 hours)",
+            "low-deviation flags mark unusual hours vs neighbouring weeks (holidays, storms), not errors",
         ],
     }
 
@@ -126,14 +139,14 @@ def main():
 
     logging.info("curated files written: %d", len(keys))
     logging.info(
-        "rows raw=%d curated=%d | missing UTC hours=%d | low outlier rows=%d",
-        len(raw), len(out), len(missing), report["low_outlier_rows"],
+        "rows raw=%d curated=%d | missing UTC hours=%d | low deviation rows=%d on %d days",
+        len(raw), len(out), len(missing), report["low_deviation_rows"], report["low_deviation_days"],
     )
-    print("\nlow outlier days (local):", report["low_outlier_days_local"])
+    print("\nflagged hours by local day (top 10):", report["top_days_by_flagged_hours"])
     print(
         out.nsmallest(8, "ratio_to_baseline")[
             ["ts_utc", "local_label", "pjm_mw", "baseline_mw", "ratio_to_baseline"]
-        ].round(2).to_string(index=False)
+        ].round({"baseline_mw": 0, "ratio_to_baseline": 2}).to_string(index=False)
     )
 
 
