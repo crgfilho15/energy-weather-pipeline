@@ -24,3 +24,8 @@ def put_json(client, bucket, key, payload):
     client.put_object(
         Bucket=bucket, Key=key, Body=body, ContentType="application/json"
     )
+
+
+def upload_file(client, bucket, key, path, metadata=None):
+    extra = {"Metadata": metadata} if metadata else None
+    client.upload_file(str(path), bucket, key, ExtraArgs=extra)
